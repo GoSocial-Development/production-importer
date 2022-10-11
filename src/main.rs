@@ -1,5 +1,5 @@
 extern crate ini;
-use anyhow::{Result};
+use anyhow::Result;
 use chrono::NaiveDate;
 use colored::Colorize;
 use ini::{Ini, Properties};
@@ -9,9 +9,9 @@ use std::fs::File;
 use std::fs::{self, OpenOptions};
 use std::io::prelude::*;
 use std::io::{self, BufRead};
-use std::ops::{Add, Div, Mul, Sub};
 use std::path::Path;
 use std::process;
+use std::thread;
 use std::time::Instant;
 use tiberius::{error::Error, AuthMethod, Client, Config, Query, Row};
 use tokio::net::TcpStream;
@@ -28,8 +28,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get("ROWS_AT_ONCE")
         .expect("ROWS_AT_ONCE config missing")
         .to_string()
-        .parse::<f64>()
+        .parse::<i32>()
         .expect("ROWS_AT_ONCE config empty");
+
+    let threads = config
+        .get("THREADS")
+        .expect("THREADS config missing")
+        .to_string()
+        .parse::<i32>()
+        .expect("THREADS config empty");
 
     let es_auth: HashMap<String, String> = get_elastic_auth(config);
 
@@ -154,11 +161,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let last_entry: i32 = rows.last().unwrap().get(&*primary_key).unwrap();
         let query_duration = query_now.elapsed();
         let rows_process_now = Instant::now();
-        rows_imported = rows_imported.add(rows.len() as f64);
+        rows_imported = rows_imported + rows.len() as f64;
         let body = build_elastic_body(
             rows,
             &fields,
-            config.get("ELASTIC_INDEX").unwrap().to_string(),
+            &config.get("ELASTIC_INDEX").unwrap().to_string(),
+            rows_at_once,
+            threads
         );
         let rows_process_duration = rows_process_now.elapsed();
         let insert_now = Instant::now();
@@ -178,9 +187,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let remaining_nr_rows = total_rows_nr.sub(rows_imported);
-        let time_per_row = (query_now.elapsed().as_millis() as f64).div(rows_at_once);
-        let time_remaining = remaining_nr_rows.mul(time_per_row).div(3600000 as f64);
+        let remaining_nr_rows = total_rows_nr - rows_imported;
+        let time_per_row = (query_now.elapsed().as_millis() as f64) / rows_at_once as f64;
+        let time_remaining = remaining_nr_rows * time_per_row / 3600000 as f64;
         print!("{}[2J", 27 as char);
         print!("{esc}[2J{esc}[1;1H", esc = 27 as char);
         println!(
@@ -279,15 +288,49 @@ fn mark_index_created(ini_path: &str) {
 fn build_elastic_body(
     rows: Vec<Row>,
     fields: &Vec<HashMap<String, String>>,
-    index: String,
+    index: &str,
+    rows_at_once: i32,
+    threads: i32,
 ) -> String {
-    let body = process_rows(rows, fields, index);
+    let mut body: Vec<String> = Vec::new();
+
+    let mut chunks: Vec<Vec<Row>> = Vec::new();
+    let mut chunk: Vec<Row> = Vec::new();
+
+    let rows_in_chunk = (rows_at_once + threads - 1) / threads;
+
+    for row in rows {
+        chunk.push(row);
+        if chunk.len() == rows_in_chunk as usize {
+            chunks.push(chunk);
+            chunk = Vec::new();
+        }
+    }
+
+    if chunk.len() > 0 {
+        chunks.push(chunk);
+    }
+
+    let mut workers = Vec::new();
+
+    for chunk in chunks {
+        let index = [index].join("");
+        let fields = fields.clone();
+        workers.push(thread::spawn(|| process_rows(chunk, fields, index)));
+    }
+
+    for w in workers {
+        for l in w.join().unwrap() {
+            body.push(l);
+        }
+    }
+
     [body.join(""), "\n".to_string()].join("")
 }
 
 fn process_rows(
     rows: Vec<Row>,
-    fields: &Vec<HashMap<String, String>>,
+    fields: Vec<HashMap<String, String>>,
     index: String,
 ) -> Vec<String> {
     let mut body: Vec<String> = Vec::new();
@@ -333,7 +376,7 @@ fn process_rows(
                     Some(v) => Value::from(v),
                     None => Value::from(""),
                 },
-                unkown => Value::from(""),
+                _unkown => Value::from(""),
             };
 
             let field_data = &fields[e.0];
@@ -342,7 +385,7 @@ fn process_rows(
                     Ok(_) => {
                         es_row[field_data.get("name").unwrap()] = value;
                     }
-                    _=>{}
+                    _ => {}
                 }
             } else {
                 es_row[field_data.get("name").unwrap()] = value;
@@ -562,6 +605,8 @@ async fn elastic_create_index(url: String, data: String, auth: &HashMap<String, 
             if e.status().to_string() == "200 OK" {
                 return true;
             }
+            let text = e.text().await.unwrap();
+            println!("{:?}", text);
             false
         }
         reqwest::Result::Err(_) => false,
@@ -632,6 +677,7 @@ fn validate_config(ini_path: &str) {
         "ELASTIC_PASS",
         "ELASTIC_INDEX",
         "ROWS_AT_ONCE",
+        "THREADS"
     ] {
         config.get(entry).or_else(|| {
             println!("{} {}", "Missing DB Config for".red(), entry);
