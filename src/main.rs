@@ -132,11 +132,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 " ",
                 &fields_select.join(","),
                 " from ",
-                config.get("DB").unwrap(),
+                config.get("SQL_DB").unwrap(),
                 ".",
-                config.get("PREFIX").unwrap(),
+                config.get("SQL_PREFIX").unwrap(),
                 ".",
-                config.get("FROM_TABLE").unwrap(),
+                config.get("FROM_SQL_TABLE").unwrap(),
                 " where ",
                 &primary_key,
                 " > ",
@@ -167,7 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &fields,
             &config.get("ELASTIC_INDEX").unwrap().to_string(),
             rows_at_once,
-            threads
+            threads,
         );
         let rows_process_duration = rows_process_now.elapsed();
         let insert_now = Instant::now();
@@ -195,8 +195,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "Imported: {} | Query: {:.2?}; Row Process Took {:.2?}; Insert Took {:.2?}; Total: {:.2?} | Time remaining {:.1?}h",
             rows_imported.to_string().green(),
-            rows_process_duration,
             query_duration,
+            rows_process_duration,
             insert_now.elapsed(),
             query_now.elapsed(),
             time_remaining
@@ -210,19 +210,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn mssql_connect(config: &Properties) -> Result<tiberius::Client<Compat<TcpStream>>, Error> {
     let mut mssql_config = Config::new();
 
-    mssql_config.host(config.get("HOST").unwrap());
+    mssql_config.host(config.get("SQL_HOST").unwrap());
     mssql_config.port(
         config
-            .get("PORT")
+            .get("SQL_PORT")
             .unwrap()
             .to_string()
             .parse::<u16>()
             .unwrap(),
     );
-    mssql_config.database(config.get("DB").unwrap());
+    mssql_config.database(config.get("SQL_DB").unwrap());
     mssql_config.authentication(AuthMethod::sql_server(
-        config.get("USER").unwrap(),
-        config.get("PASSWORD").unwrap(),
+        config.get("SQL_USER").unwrap(),
+        config.get("SQL_PASS").unwrap(),
     ));
     mssql_config.trust_cert();
 
@@ -238,10 +238,10 @@ async fn mssql_connect(config: &Properties) -> Result<tiberius::Client<Compat<Tc
 
             mssql_config.host(&host);
             mssql_config.port(port);
-            mssql_config.database(config.get("DB").unwrap());
+            mssql_config.database(config.get("SQL_DB").unwrap());
             mssql_config.authentication(AuthMethod::sql_server(
-                config.get("USER").unwrap(),
-                config.get("PASSWORD").unwrap(),
+                config.get("SQL_USER").unwrap(),
+                config.get("SQL_PASS").unwrap(),
             ));
 
             let tcp = TcpStream::connect(mssql_config.get_addr()).await?;
@@ -665,19 +665,19 @@ fn validate_config(ini_path: &str) {
         .section(Some("CONFIG"))
         .expect("CONFIG section missing from INI");
     for entry in [
-        "HOST",
-        "PORT",
-        "USER",
-        "PASSWORD",
-        "DB",
-        "PREFIX",
-        "FROM_TABLE",
+        "SQL_HOST",
+        "SQL_PORT",
+        "SQL_USER",
+        "SQL_PASS",
+        "SQL_DB",
+        "SQL_PREFIX",
+        "FROM_SQL_TABLE",
         "ELASTIC_HOST",
         "ELASTIC_USER",
         "ELASTIC_PASS",
         "ELASTIC_INDEX",
         "ROWS_AT_ONCE",
-        "THREADS"
+        "THREADS",
     ] {
         config.get(entry).or_else(|| {
             println!("{} {}", "Missing DB Config for".red(), entry);
@@ -690,12 +690,12 @@ async fn get_primary_key(config: &Properties) -> Result<String, anyhow::Error> {
     let mut client = mssql_connect(config).await.unwrap();
     let primary_query = Query::new([
         "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE WHERE OBJECTPROPERTY(OBJECT_ID(CONSTRAINT_SCHEMA + '.' + QUOTENAME(CONSTRAINT_NAME)), 'IsPrimaryKey') = 1 AND TABLE_SCHEMA ='",
-        config.get("PREFIX").unwrap(),
+        config.get("SQL_PREFIX").unwrap(),
         "'",
         " AND TABLE_CATALOG = '",
-        config.get("DB").unwrap(),
+        config.get("SQL_DB").unwrap(),
         "' AND TABLE_NAME ='",
-        config.get("FROM_TABLE").unwrap(),
+        config.get("FROM_SQL_TABLE").unwrap(),
         "'"
     ].join("").to_string());
 
@@ -715,12 +715,12 @@ async fn get_mapping(config: &Properties) -> Result<Vec<Row>, anyhow::Error> {
     let mapping_select = Query::new(
         [
             "SELECT DATA_TYPE , COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA ='",
-            config.get("PREFIX").unwrap(),
+            config.get("SQL_PREFIX").unwrap(),
             "'",
             " AND TABLE_CATALOG = '",
-            config.get("DB").unwrap(),
+            config.get("SQL_DB").unwrap(),
             "' AND TABLE_NAME ='",
-            config.get("FROM_TABLE").unwrap(),
+            config.get("FROM_SQL_TABLE").unwrap(),
             "'",
         ]
         .join("")
@@ -740,11 +740,11 @@ async fn get_total_nr_rows(
     let select = Query::new(
         [
             "SELECT count(*) as  total from ",
-            config.get("DB").unwrap(),
+            config.get("SQL_DB").unwrap(),
             ".",
-            config.get("PREFIX").unwrap(),
+            config.get("SQL_PREFIX").unwrap(),
             ".",
-            config.get("FROM_TABLE").unwrap(),
+            config.get("FROM_SQL_TABLE").unwrap(),
             " where ",
             &primary_key,
             " > ",
