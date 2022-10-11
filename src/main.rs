@@ -9,6 +9,7 @@ use std::fs::File;
 use std::fs::{self, OpenOptions};
 use std::io::prelude::*;
 use std::io::{self, BufRead};
+use std::num::ParseFloatError;
 use std::path::Path;
 use std::process;
 use std::thread;
@@ -17,12 +18,22 @@ use tiberius::{error::Error, AuthMethod, Client, Config, Query, Row};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
+#[derive(Clone)]
+struct GeoConfig {
+    field_name: String,
+    lat_field: String,
+    lon_field: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ini_path = "./config.ini";
     validate_config(ini_path);
     let ini = Ini::load_from_file(ini_path).unwrap();
     let config: &Properties = ini.section(Some("CONFIG")).unwrap();
+
+    let catch_all_config = get_catch_all_conf(config.get("CATCHALL").unwrap_or(""));
+    let geo_config = geo_field_config(config);
 
     let rows_at_once = config
         .get("ROWS_AT_ONCE")
@@ -57,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", "Grabbed Primary Table Key".green());
 
     let mapping_rows = get_mapping(config).await.unwrap();
-    let mapping = create_mapping(mapping_rows).unwrap();
+    let mapping = create_mapping(mapping_rows, &catch_all_config, &geo_config).unwrap();
     println!("{}", "Grabbed Mapping Rows".green());
 
     let total_rows_nr = get_total_nr_rows(config, &primary_key, &last_row)
@@ -102,9 +113,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut field_data = HashMap::new();
         field_data.insert("name".to_string(), field.to_string());
         field_data.insert("type".to_string(), x["type"].to_string());
-        if field != "the_geom"
-            && field != "id_catchall"
-            && field != "name_catchall"
+        if field != &geo_config.field_name
+            && !catch_all_config.keys().any(|k| field == k)
             && x["type"].as_str().unwrap() != "date"
         {
             fields_select.push(field.to_string());
@@ -168,6 +178,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &config.get("ELASTIC_INDEX").unwrap().to_string(),
             rows_at_once,
             threads,
+            &catch_all_config,
+            &geo_config,
         );
         let rows_process_duration = rows_process_now.elapsed();
         let insert_now = Instant::now();
@@ -291,6 +303,8 @@ fn build_elastic_body(
     index: &str,
     rows_at_once: i32,
     threads: i32,
+    catch_all_config: &HashMap<String, Vec<String>>,
+    geo_config: &GeoConfig,
 ) -> String {
     let mut body: Vec<String> = Vec::new();
 
@@ -316,7 +330,11 @@ fn build_elastic_body(
     for chunk in chunks {
         let index = [index].join("");
         let fields = fields.clone();
-        workers.push(thread::spawn(|| process_rows(chunk, fields, index)));
+        let catch_all_config = catch_all_config.clone();
+        let geo_config = geo_config.clone();
+        workers.push(thread::spawn(|| {
+            process_rows(chunk, fields, index, catch_all_config, geo_config)
+        }));
     }
 
     for w in workers {
@@ -332,6 +350,8 @@ fn process_rows(
     rows: Vec<Row>,
     fields: Vec<HashMap<String, String>>,
     index: String,
+    catch_all_config: HashMap<String, Vec<String>>,
+    geo_config: GeoConfig,
 ) -> Vec<String> {
     let mut body: Vec<String> = Vec::new();
     for row in rows {
@@ -359,11 +379,11 @@ fn process_rows(
                 },
                 tiberius::ColumnData::F32(value) => match value {
                     Some(v) => Value::from(v),
-                    None => Value::from(0 as f32),
+                    None => Value::from(0 as i32),
                 },
                 tiberius::ColumnData::F64(value) => match value {
                     Some(v) => Value::from(v),
-                    None => Value::from(0 as f64),
+                    None => Value::from(0 as i32),
                 },
                 tiberius::ColumnData::Numeric(value) => match value {
                     Some(v) => match v.to_string().parse::<f32>() {
@@ -373,7 +393,10 @@ fn process_rows(
                     None => Value::from(0 as i32),
                 },
                 tiberius::ColumnData::String(value) => match value {
-                    Some(v) => Value::from(v),
+                    Some(v) => match parse_str_to_nr(&v) {
+                        Ok(v) => Value::from(v.to_string()),
+                        Err(_) => Value::from(v),
+                    },
                     None => Value::from(""),
                 },
                 _unkown => Value::from(""),
@@ -391,31 +414,27 @@ fn process_rows(
                 es_row[field_data.get("name").unwrap()] = value;
             }
         }
-        es_row["the_geom"] = json!({
-            "type": "point",
-            "coordinates": [
-                es_row["locLongWGS84_wh"],
-                es_row["locLatWGS84_wh"]
-            ]
-        });
-        es_row["id_catchall"] = Value::from(
-            [
-                es_row["eOwnerID"].to_string(),
-                es_row["eNormalizedID"].to_string(),
-                es_row["wprdOperIDHartStandard"].to_string(),
-            ]
-            .join(","),
-        );
-        es_row["name_catchall"] = Value::from(
-            [
-                es_row["wlaAPIHartStandard"].to_string(),
-                es_row["wlaWellNum"].to_string(),
-                es_row["wlaWellName"].to_string(),
-                es_row["wlaLeaseName"].to_string(),
-                es_row["wlaLeaseNum"].to_string(),
-            ]
-            .join(" "),
-        );
+
+        for key in catch_all_config.keys() {
+            let fields = catch_all_config.get(key).unwrap();
+            let mut values = Vec::new();
+            for f in fields {
+                values.push(es_row[f].to_string());
+            }
+            es_row[key] = Value::from(values.join(" "));
+        }
+        if geo_config.field_name.len() > 0
+            && geo_config.lat_field.len() > 0
+            && geo_config.lon_field.len() > 0
+        {
+            es_row[&geo_config.field_name] = json!({
+                "type": "point",
+                "coordinates": [
+                    es_row[&geo_config.lon_field],
+                    es_row[&geo_config.lat_field]
+                ]
+            });
+        }
 
         body.push([json!(es_row).to_string(), "\n".to_string()].join(""));
     }
@@ -487,7 +506,11 @@ async fn insert_elastic(
     }
 }
 
-fn create_mapping(rows: Vec<Row>) -> Result<Value, anyhow::Error> {
+fn create_mapping(
+    rows: Vec<Row>,
+    catch_all_config: &HashMap<String, Vec<String>>,
+    geo_config: &GeoConfig,
+) -> Result<Value, anyhow::Error> {
     let mut mapping = json!({
         "settings": {
             "index": {
@@ -510,31 +533,33 @@ fn create_mapping(rows: Vec<Row>) -> Result<Value, anyhow::Error> {
         "mappings":{
             "data":{
                 "properties":{
-                    "the_geom":{
-                        "type": "geo_shape"
-                    },
-                    "id_catchall":{
-                        "type": "text",
-                        "fields": {
-                          "keyword": {
-                            "type": "keyword"
-                          }
-                        },
-                        "analyzer": "lowercase_analyzer"
-                    },
-                    "name_catchall":{
-                        "type": "text",
-                        "fields": {
-                          "keyword": {
-                            "type": "keyword"
-                          }
-                        },
-                        "analyzer": "lowercase_analyzer"
-                    }
+
                 }
             }
         }
     });
+
+    if geo_config.field_name.len() > 0
+        && geo_config.lat_field.len() > 0
+        && geo_config.lon_field.len() > 0
+    {
+        mapping["mappings"]["data"]["properties"][&geo_config.field_name] = json!({
+          "type": "geo_shape"
+        });
+    }
+
+    for key in catch_all_config.keys() {
+        mapping["mappings"]["data"]["properties"][key] = json!({
+            "type": "text",
+            "fields": {
+              "keyword": {
+                "type": "keyword"
+              }
+            },
+            "analyzer": "lowercase_analyzer"
+        });
+    }
+
     for row in rows {
         let field = row
             .try_get::<&str, _>("COLUMN_NAME")?
@@ -571,7 +596,7 @@ fn create_mapping(rows: Vec<Row>) -> Result<Value, anyhow::Error> {
             mapping["mappings"]["data"]["properties"][field] = json!({
               "type": "integer"
             });
-        } else if field_type == "date" || field_type == "datetime2" {
+        } else if field_type == "date" || field_type == "datetime2" || field_type == "datetime" {
             mapping["mappings"]["data"]["properties"][field] = json!({
               "type": "date"
             });
@@ -756,4 +781,37 @@ async fn get_total_nr_rows(
     let stream = select.query(&mut client).await?;
     let total_row = stream.into_row().await?;
     Ok(total_row.unwrap().get::<i32, _>("total").unwrap() as f64)
+}
+
+fn parse_str_to_nr(nr: &str) -> anyhow::Result<f32, ParseFloatError> {
+    match nr.to_string().parse::<f32>() {
+        Ok(nr) => Ok(nr),
+        Err(e) => Err(e),
+    }
+}
+
+fn geo_field_config(config: &Properties) -> GeoConfig {
+    GeoConfig {
+        field_name: config.get("ELASTIC_GEO_FIELD").unwrap_or("").to_string(),
+        lat_field: config.get("SQL_LAT_FIELD").unwrap_or("").to_string(),
+        lon_field: config.get("SQL_LON_FIELD").unwrap_or("").to_string(),
+    }
+}
+
+fn get_catch_all_conf(catch_all_string: &str) -> HashMap<String, Vec<String>> {
+    let mut result = HashMap::new();
+    if catch_all_string.len() > 0 {
+        let parts = catch_all_string.split("|");
+        for p in parts {
+            let conf_part = p.split("=").collect::<Vec<&str>>();
+            let val = conf_part[1]
+                .split(",")
+                .collect::<Vec<&str>>()
+                .iter()
+                .map(|str| str.to_string())
+                .collect();
+            result.insert(conf_part[0].to_string(), val);
+        }
+    }
+    result
 }
