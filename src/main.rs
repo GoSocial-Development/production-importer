@@ -163,11 +163,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let rows = match stream.into_first_result().await {
             Ok(rows) => rows,
-            Err(_) => {
-                println!("{}", "NO MORE ROWS".blink());
-                break;
+            Err(e) => {
+                println!("{}: {}", "Error grabbing rows".red(), e);
+                process::exit(1);
             }
         };
+        if rows.len() == 0 {
+            break;
+        }
         let last_entry: i32 = rows.last().unwrap().get(&*primary_key).unwrap();
         let query_duration = query_now.elapsed();
         let rows_process_now = Instant::now();
@@ -215,6 +218,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         update_last_row(last_row, ini_path);
     }
+
+    println!("{}", "IMPORT FINISHED !!!".bright_green().bold().blink());
 
     Ok(())
 }
@@ -368,6 +373,8 @@ fn process_rows(
             .join(""),
         );
         for e in row.into_iter().enumerate() {
+            let field_data = &fields[e.0];
+            let mut ignore_value = false;
             let value = match e.1 {
                 tiberius::ColumnData::I32(value) => match value {
                     Some(v) => Value::from(v),
@@ -392,26 +399,43 @@ fn process_rows(
                     },
                     None => Value::from(0 as i32),
                 },
+                tiberius::ColumnData::Bit(value) => match value {
+                    Some(v) => Value::Bool(v),
+                    None => Value::Bool(false),
+                },
                 tiberius::ColumnData::String(value) => match value {
                     Some(v) => match parse_str_to_nr(&v) {
                         Ok(v) => Value::from(v.to_string()),
                         Err(_) => Value::from(v),
                     },
-                    None => Value::from(""),
-                },
-                _unkown => Value::from(""),
-            };
-
-            let field_data = &fields[e.0];
-            if field_data.get("type").unwrap() == "\"date\"" {
-                match NaiveDate::parse_from_str(&value.to_string().replace("\"", ""), "%Y-%m-%d") {
-                    Ok(_) => {
-                        es_row[field_data.get("name").unwrap()] = value;
+                    None => {
+                        ignore_value = true;
+                        Value::from("")
                     }
-                    _ => {}
+                },
+                _unkown => {
+                    ignore_value = true;
+                    Value::from("")
                 }
-            } else {
-                es_row[field_data.get("name").unwrap()] = value;
+            };
+            if !ignore_value {
+                if field_data.get("type").unwrap() == "\"date\"" {
+                    match NaiveDate::parse_from_str(
+                        &value.to_string().replace("\"", ""),
+                        "%Y-%m-%d",
+                    ) {
+                        Ok(_) => {
+                            es_row[field_data.get("name").unwrap()] = value;
+                        }
+                        _ => {}
+                    }
+                } else if field_data.get("type").unwrap() == "\"text\""
+                    && value.to_string() != "\"\""
+                {
+                    es_row[field_data.get("name").unwrap()] = value;
+                } else if field_data.get("type").unwrap() != "\"text\"" {
+                    es_row[field_data.get("name").unwrap()] = value;
+                }
             }
         }
 
@@ -419,7 +443,7 @@ fn process_rows(
             let fields = catch_all_config.get(key).unwrap();
             let mut values = Vec::new();
             for f in fields {
-                values.push(es_row[f].to_string());
+                values.push(es_row[f].to_string().replace("\"", ""));
             }
             es_row[key] = Value::from(values.join(" "));
         }
@@ -472,7 +496,10 @@ async fn insert_elastic(
                     "ElasticSearch Index is READ ONLY, Stopping Import"
                 ));
             }
-            let json: Value = serde_json::from_str(&text).unwrap();
+            let json: Value = serde_json::from_str(&text).unwrap_or_else(|e| {
+                println!("{} {}", "Error parsing ES response".red(), e);
+                process::exit(1);
+            });
             if json["errors"].as_bool().unwrap_or(false) {
                 let mut errors: i32 = 0;
                 for item in json["items"].as_array() {
@@ -600,6 +627,10 @@ fn create_mapping(
             mapping["mappings"]["data"]["properties"][field] = json!({
               "type": "date"
             });
+        } else if field_type == "bit" {
+            mapping["mappings"]["data"]["properties"][field] = json!({
+              "type": "boolean"
+            });
         } else {
             println!("{} {}", "Ignored field tipe:".yellow(), field_type);
         }
@@ -610,7 +641,15 @@ fn create_mapping(
 
 async fn elastic_create_index(url: String, data: String, auth: &HashMap<String, String>) -> bool {
     let client = reqwest::Client::new();
-    match client.delete(&url).send().await {
+    match client
+        .delete(&url)
+        .basic_auth(
+            auth.get("username").unwrap(),
+            Some(auth.get("password").unwrap()),
+        )
+        .send()
+        .await
+    {
         reqwest::Result::Ok(_) => true,
         reqwest::Result::Err(_) => true,
     };
