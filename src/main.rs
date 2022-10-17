@@ -454,8 +454,8 @@ fn process_rows(
             es_row[&geo_config.field_name] = json!({
                 "type": "point",
                 "coordinates": [
-                    es_row[&geo_config.lon_field],
-                    es_row[&geo_config.lat_field]
+                    es_row[&geo_config.lon_field].to_string().replace("\"", "").parse::<f64>().unwrap_or(0 as f64),
+                    es_row[&geo_config.lat_field].to_string().replace("\"", "").parse::<f64>().unwrap_or(0 as f64)
                 ]
             });
         }
