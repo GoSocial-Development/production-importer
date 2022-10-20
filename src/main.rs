@@ -125,7 +125,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 [
                     "convert(varchar, ",
                     &field.to_string(),
-                    ", 23) as ",
+                    ", ",
+                    config.get("DATE_FORMAT").unwrap_or("23"),
+                    ") as ",
                     &field.to_string(),
                 ]
                 .join(""),
@@ -183,6 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             threads,
             &catch_all_config,
             &geo_config,
+            &config.get("DATE_FORMAT").unwrap_or("23").to_string()
         );
         let rows_process_duration = rows_process_now.elapsed();
         let insert_now = Instant::now();
@@ -310,6 +313,7 @@ fn build_elastic_body(
     threads: i32,
     catch_all_config: &HashMap<String, Vec<String>>,
     geo_config: &GeoConfig,
+    date_format: &str
 ) -> String {
     let mut body: Vec<String> = Vec::new();
 
@@ -337,8 +341,9 @@ fn build_elastic_body(
         let fields = fields.clone();
         let catch_all_config = catch_all_config.clone();
         let geo_config = geo_config.clone();
+        let date_format = date_format.to_string();
         workers.push(thread::spawn(|| {
-            process_rows(chunk, fields, index, catch_all_config, geo_config)
+            process_rows(chunk, fields, index, catch_all_config, geo_config, date_format)
         }));
     }
 
@@ -357,6 +362,7 @@ fn process_rows(
     index: String,
     catch_all_config: HashMap<String, Vec<String>>,
     geo_config: GeoConfig,
+    date_format: String
 ) -> Vec<String> {
     let mut body: Vec<String> = Vec::new();
     for row in rows {
@@ -420,9 +426,13 @@ fn process_rows(
             };
             if !ignore_value {
                 if field_data.get("type").unwrap() == "\"date\"" {
+                    let mut format = "%Y-%m-%d";
+                    if  date_format == "20" {
+                        format ="%Y-%m-%d %H:%M:%S";
+                    }
                     match NaiveDate::parse_from_str(
                         &value.to_string().replace("\"", ""),
-                        "%Y-%m-%d",
+                        format,
                     ) {
                         Ok(_) => {
                             es_row[field_data.get("name").unwrap()] = value;
@@ -625,7 +635,8 @@ fn create_mapping(
             });
         } else if field_type == "date" || field_type == "datetime2" || field_type == "datetime" {
             mapping["mappings"]["data"]["properties"][field] = json!({
-              "type": "date"
+              "type": "date",
+              "format": "yyyy-MM-dd HH:mm:ss||yyyy-MM-dd||epoch_millis"
             });
         } else if field_type == "bit" {
             mapping["mappings"]["data"]["properties"][field] = json!({
