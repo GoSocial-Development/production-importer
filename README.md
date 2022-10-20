@@ -27,6 +27,7 @@
     - `SQL_LAT_FIELD` - Name of the field of the LAT value
     - `SQL_LON_FIELD` - Name of the field of the LON value
     - `CATCHALL` - List catch all fields that need to be created in this format myCombinedField=fieldA,FieldB;MyOtherCombinedField=fieldC;FieldZ
+
 \* \- required
 
 ## Requirements
