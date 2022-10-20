@@ -22,7 +22,7 @@
     - `ES_INDEX_CREATED` - yes/no if no it creates the es index (deleting any existing one)
     - `LAST_ROW` - Config.FROM_TABLE last primary key inserted
     - `THREADS`* - #Threads used for row processing, everything else is single threaded
-    - `DATE_FORMAT`* - Format of the date fields (uses this pattern, values 1 - 130 are accepted: [all possible values](https://learn.microsoft.com/en-us/sql/t-sql/functions/cast-and-convert-transact-sql?view=sql-server-ver16#date-and-time-styles) )
+    - `DATE_FORMAT`* - Format of the date fields (uses this pattern, only values 20 or 23 are accepted: [all possible values](https://learn.microsoft.com/en-us/sql/t-sql/functions/cast-and-convert-transact-sql?view=sql-server-ver16#date-and-time-styles) )
     - `ELASTIC_GEO_FIELD` - name of the geo_shape field if a geo field needs to be created, Points only
     - `SQL_LAT_FIELD` - Name of the field of the LAT value
     - `SQL_LON_FIELD` - Name of the field of the LON value
